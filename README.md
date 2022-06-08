@@ -1,5 +1,5 @@
 <p align="center">
-<img src="https://raw.githubusercontent.com/OpenVSLAM-Community/openvslam/main/docs/img/logo.png" width="435px">
+  <img src="https://raw.githubusercontent.com/OpenVSLAM-Community/openvslam/main/docs/img/logo.png" width="435px">
 </p>
 
 # OpenVSLAM: A Versatile Visual SLAM Framework
