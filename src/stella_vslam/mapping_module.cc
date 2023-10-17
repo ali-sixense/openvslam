@@ -8,6 +8,7 @@
 #include "stella_vslam/match/fuse.h"
 #include "stella_vslam/match/robust.h"
 #include "stella_vslam/module/two_view_triangulator.h"
+#include "stella_vslam/optimize/local_bundle_adjuster_factory.h"
 #include "stella_vslam/solve/essential_solver.h"
 
 #include <thread>
@@ -19,12 +20,15 @@ namespace stella_vslam {
 mapping_module::mapping_module(const YAML::Node& yaml_node, data::map_database* map_db, data::bow_database* bow_db, data::bow_vocabulary* bow_vocab)
     : local_map_cleaner_(new module::local_map_cleaner(yaml_node, map_db, bow_db)),
       map_db_(map_db), bow_db_(bow_db), bow_vocab_(bow_vocab),
-      local_bundle_adjuster_(new optimize::local_bundle_adjuster(yaml_node)),
+      local_bundle_adjuster_(optimize::local_bundle_adjuster_factory::create(yaml_node)),
       enable_interruption_of_landmark_generation_(yaml_node["enable_interruption_of_landmark_generation"].as<bool>(true)),
       enable_interruption_before_local_BA_(yaml_node["enable_interruption_before_local_BA"].as<bool>(true)),
       num_covisibilities_for_landmark_generation_(yaml_node["num_covisibilities_for_landmark_generation"].as<unsigned int>(10)),
-      num_covisibilities_for_landmark_fusion_(yaml_node["num_covisibilities_for_landmark_fusion"].as<unsigned int>(10)) {
+      num_covisibilities_for_landmark_fusion_(yaml_node["num_covisibilities_for_landmark_fusion"].as<unsigned int>(10)),
+      erase_temporal_keyframes_(yaml_node["erase_temporal_keyframes"].as<bool>(false)),
+      num_temporal_keyframes_(yaml_node["num_temporal_keyframes"].as<unsigned int>(15)) {
     spdlog::debug("CONSTRUCT: mapping_module");
+
     spdlog::debug("load mapping parameters");
 
     spdlog::debug("load monocular mappping parameters");
@@ -59,7 +63,6 @@ void mapping_module::run() {
     spdlog::info("start mapping module");
 
     is_terminated_ = false;
-    set_is_idle(true);
 
     while (true) {
         // waiting time for the other threads
@@ -77,7 +80,6 @@ void mapping_module::run() {
         if (reset_is_requested()) {
             // reset and continue
             reset();
-            set_is_idle(true);
             continue;
         }
 
@@ -87,7 +89,6 @@ void mapping_module::run() {
             auto future_stop_keyframe_insertion = tracker_->async_stop_keyframe_insertion();
             future_stop_keyframe_insertion.get();
             if (!keyframe_is_queued()) {
-                set_is_idle(true);
                 pause();
                 SPDLOG_TRACE("mapping_module: waiting");
                 // check if termination or reset is requested during pause
@@ -102,11 +103,9 @@ void mapping_module::run() {
 
         // if the queue is empty, the following process is not needed
         if (!keyframe_is_queued()) {
-            set_is_idle(true);
             continue;
         }
 
-        set_is_idle(false);
         // create and extend the map with the new keyframe
         mapping_with_new_keyframe();
         // send the new keyframe to the global optimization module
@@ -118,10 +117,12 @@ void mapping_module::run() {
     spdlog::info("terminate mapping module");
 }
 
-void mapping_module::queue_keyframe(const std::shared_ptr<data::keyframe>& keyfrm) {
+std::shared_future<void> mapping_module::async_add_keyframe(const std::shared_ptr<data::keyframe>& keyfrm) {
     std::lock_guard<std::mutex> lock(mtx_keyfrm_queue_);
     keyfrms_queue_.push_back(keyfrm);
     abort_local_BA_ = true;
+    promise_add_keyfrm_queue_.emplace_back();
+    return promise_add_keyfrm_queue_.back().get_future().share();
 }
 
 unsigned int mapping_module::get_num_queued_keyframes() const {
@@ -132,20 +133,6 @@ unsigned int mapping_module::get_num_queued_keyframes() const {
 bool mapping_module::keyframe_is_queued() const {
     std::lock_guard<std::mutex> lock(mtx_keyfrm_queue_);
     return !keyfrms_queue_.empty();
-}
-
-bool mapping_module::is_idle() const {
-    return is_idle_;
-}
-
-void mapping_module::set_is_idle(const bool is_idle) {
-    is_idle_ = is_idle;
-
-#ifdef DETERMINISTIC
-    // alert the tracker that it can carry on
-    if (is_idle_)
-        processing_cv_.notify_one();
-#endif
 }
 
 bool mapping_module::is_skipping_localBA() const {
@@ -165,11 +152,6 @@ void mapping_module::mapping_with_new_keyframe() {
         cur_keyfrm_ = keyfrms_queue_.front();
         keyfrms_queue_.pop_front();
     }
-
-#ifdef DETERMINISTIC
-    // prevent the tracker running on unprocessed data
-    std::lock_guard<std::mutex> tracking_lock(mtx_processing_);
-#endif
 
     SPDLOG_TRACE("mapping_module: current keyframe is {}", cur_keyfrm_->id_);
 
@@ -202,6 +184,11 @@ void mapping_module::mapping_with_new_keyframe() {
     update_new_keyframe();
 
     if (enable_interruption_before_local_BA_ && (keyframe_is_queued() || pause_is_requested())) {
+        {
+            std::lock_guard<std::mutex> lock(mtx_keyfrm_queue_);
+            promise_add_keyfrm_queue_.front().set_value();
+            promise_add_keyfrm_queue_.pop_front();
+        }
         return;
     }
 
@@ -218,7 +205,43 @@ void mapping_module::mapping_with_new_keyframe() {
             local_bundle_adjuster_->optimize(map_db_, cur_keyfrm_, &abort_local_BA_);
         }
     }
+
+    if (erase_temporal_keyframes_) {
+        for (const auto& keyfrm : map_db_->get_all_keyframes()) {
+            if (keyfrm->id_ <= map_db_->get_fixed_keyframe_id_threshold()) {
+                continue;
+            }
+
+            // erase temporal keyframes after a period of time
+            if (keyfrm->id_ > map_db_->get_fixed_keyframe_id_threshold()
+                && cur_keyfrm_->id_ > keyfrm->id_ + num_temporal_keyframes_) {
+                const auto cur_landmarks = keyfrm->get_landmarks();
+                keyfrm->prepare_for_erasing(map_db_, bow_db_);
+                for (const auto& lm : cur_landmarks) {
+                    if (!lm) {
+                        continue;
+                    }
+                    if (lm->will_be_erased()) {
+                        continue;
+                    }
+                    if (!lm->has_representative_descriptor()) {
+                        lm->compute_descriptor();
+                    }
+                    if (!lm->has_valid_prediction_parameters()) {
+                        lm->update_mean_normal_and_obs_scale_variance();
+                    }
+                }
+            }
+        }
+    }
+
     local_map_cleaner_->remove_redundant_keyframes(cur_keyfrm_);
+
+    {
+        std::lock_guard<std::mutex> lock(mtx_keyfrm_queue_);
+        promise_add_keyfrm_queue_.front().set_value();
+        promise_add_keyfrm_queue_.pop_front();
+    }
 }
 
 void mapping_module::store_new_keyframe() {
@@ -519,6 +542,13 @@ void mapping_module::reset() {
     std::lock_guard<std::mutex> lock(mtx_reset_);
     spdlog::info("reset mapping module");
     keyfrms_queue_.clear();
+    {
+        std::lock_guard<std::mutex> lock_keyfrm_queue(mtx_keyfrm_queue_);
+        while (!promise_add_keyfrm_queue_.empty()) {
+            promise_add_keyfrm_queue_.front().set_value();
+            promise_add_keyfrm_queue_.pop_front();
+        }
+    }
     local_map_cleaner_->reset();
     reset_is_requested_ = false;
     promise_reset_.set_value();
@@ -612,7 +642,6 @@ void mapping_module::terminate() {
     {
         std::lock_guard<std::mutex> lock_terminate(mtx_terminate_);
         is_terminated_ = true;
-        set_is_idle(true);
         promise_terminate_.set_value();
         promise_terminate_ = std::promise<void>();
         future_terminate_ = std::shared_future<void>();

@@ -198,9 +198,7 @@ bool keyframe::bind_to_stmt(sqlite3* db, sqlite3_stmt* stmt) const {
     ret = sqlite3_bind_int64(stmt, column_id++, id_);
     // NOTE: src_frm_id is removed
     column_id++;
-    if (ret == SQLITE_OK) {
-        ret = sqlite3_bind_double(stmt, column_id++, timestamp_);
-    }
+    ret = sqlite3_bind_double(stmt, column_id++, timestamp_);
     if (ret == SQLITE_OK) {
         const auto& camera_name = camera_->name_;
         ret = sqlite3_bind_blob(stmt, column_id++, camera_name.c_str(), camera_name.size(), SQLITE_TRANSIENT);
@@ -258,10 +256,6 @@ void keyframe::set_pose_cw(const Mat44_t& pose_cw) {
     pose_wc_ = Mat44_t::Identity();
     pose_wc_.block<3, 3>(0, 0) = rot_wc;
     pose_wc_.block<3, 1>(0, 3) = trans_wc_;
-}
-
-void keyframe::set_pose_cw(const g2o::SE3Quat& pose_cw) {
-    set_pose_cw(util::converter::to_eigen_mat(pose_cw));
 }
 
 Mat44_t keyframe::get_pose_cw() const {
