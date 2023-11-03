@@ -322,6 +322,10 @@ bool system::tracker_is_paused() const {
     return tracker_->is_paused();
 }
 
+bool system::tracker_is_lost() const {
+    return tracker_->is_lost();
+}
+
 void system::resume_tracker() {
     tracker_->resume();
 }

@@ -690,6 +690,10 @@ bool tracking_module::is_paused() const {
     return is_paused_;
 }
 
+bool tracking_module::is_lost() const {
+    return tracking_state_ == tracker_state_t::Lost;
+}
+
 void tracking_module::resume() {
     std::lock_guard<std::mutex> lock(mtx_pause_);
 

@@ -132,6 +132,8 @@ public:
     //! The tracking module is paused or not
     bool tracker_is_paused() const;
 
+    bool tracker_is_lost() const;
+
     //! Resume the tracking module
     void resume_tracker();
 
